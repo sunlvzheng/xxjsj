@@ -4,7 +4,9 @@
 
 单文件实现（`index.html`），仅依赖 CDN 上的 three.js r169。
 
-![预览](preview.png)
+在线案例：https://sunlvzheng.github.io/xxjsj/
+
+[行星减速机选型页](https://sunlvzheng.github.io/xxjsj/ "星减速项目页面")
 
 ## 界面构成
 
