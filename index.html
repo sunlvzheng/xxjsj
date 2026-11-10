@@ -729,6 +729,7 @@ const state = {
 };
 
 const BASE_SPEED = 1.6;
+let lastK = -1;   // 上一次构建的级数，用于判断是否需要重新定向视角
 
 /* =========================================================
  * 6. 参数化装配（k 级串联）
@@ -1013,7 +1014,7 @@ function silhouettePoints() {
   return pts;
 }
 
-function frameModel(padding = 1.20) {
+function frameModel(padding = 1.28) {
   const pts = silhouettePoints();
   let dist = D.outerR * 4;
   const v = new THREE.Vector3();
@@ -1065,11 +1066,48 @@ function frameModel(padding = 1.20) {
   controls.update();
 }
 
+/**
+ * 仅重新调整相机距离，保留用户当前的视角方向与目标点
+ * 用于爆炸切换、窗口尺寸变化等“不应该重置视角”的场景
+ */
+function refitDistance(padding = 1.20) {
+  const target = controls.target.clone();
+  const dir = camera.position.clone().sub(target);
+  const dist0 = dir.length();
+  if (!Number.isFinite(dist0) || dist0 < 1e-3) { frameModel(padding); return; }
+  dir.normalize();
+
+  const pts = silhouettePoints();
+  let dist = dist0;
+  const v = new THREE.Vector3();
+
+  for (let it = 0; it < 12; it++) {
+    camera.position.copy(target).addScaledVector(dir, dist);
+    camera.lookAt(target);
+    camera.updateMatrixWorld();
+    let maxNdc = 0;
+    for (const p of pts) {
+      v.copy(p).project(camera);
+      maxNdc = Math.max(maxNdc, Math.abs(v.x), Math.abs(v.y));
+    }
+    dist *= maxNdc * padding;
+  }
+
+  camera.position.copy(target).addScaledVector(dir, dist);
+  camera.near = Math.max(0.05, dist * 0.002);
+  camera.far = dist * 10;
+  camera.updateProjectionMatrix();
+
+  controls.minDistance = dist * 0.28;
+  controls.maxDistance = dist * 3.4;
+  controls.update();
+}
+
 function setView(name) {
   state.view = name;
   VIEW_DIR.copy(dirFor(name));
   camera.up.set(0, 1, 0);
-  frameModel(1.20);
+  frameModel(1.28);
   document.querySelectorAll('.vbtn').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
 }
 
@@ -1101,7 +1139,11 @@ function animate() {
     needsBuild = false;
     build();
     updateAll();
-    if (state.autoFit) frameModel();
+    if (state.autoFit) {
+      // 级数变化时重新定向并取景；其余参数只重新适配距离，保留用户视角
+      if (D.k !== lastK) { lastK = D.k; frameModel(); }
+      else refitDistance(1.20);
+    }
   }
 
   if (state.running) state.sunAngle += dt * BASE_SPEED * state.speedMul;
@@ -1357,7 +1399,7 @@ $('btn-section').addEventListener('click', (e) => {
 $('btn-explode').addEventListener('click', (e) => {
   state.explode = state.explode ? 0 : 1;
   e.currentTarget.classList.toggle('active', !!state.explode);
-  if (state.autoFit) frameModel(1.20);
+  if (state.autoFit) refitDistance(1.20);   // 只调距离，不重置视角
 });
 
 $('btn-wire').addEventListener('click', (e) => {
@@ -1427,7 +1469,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight, false);
-  if (state.autoFit) frameModel();
+  if (state.autoFit) refitDistance(1.20);   // 保持当前视角，只重新适配距离
 });
 
 window.addEventListener('keydown', (e) => {
