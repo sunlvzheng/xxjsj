@@ -107,6 +107,7 @@
     background: rgba(77, 163, 255, .12); border-radius: 5px; padding: 1px 6px; font-size: 11px;
   }
   .ctl { margin-bottom: 10px; }
+  .hint { margin: -6px 0 10px; font-size: 10px; color: var(--dim2); line-height: 1.4; }
   input[type=range] { width: 100%; height: 16px; margin: 0; cursor: pointer; accent-color: var(--accent); }
 
   select {
@@ -271,8 +272,9 @@
       <input id="i-b" type="range" autocomplete="off" min="1" max="8" step="0.5" value="4">
     </div>
     <div class="ctl">
-      <div class="fhd"><span>输入转速</span><b id="o-rpm">15 r/min</b></div>
-      <input id="i-speed" type="range" autocomplete="off" min="0" max="3" step="0.01" value="1">
+      <div class="fhd"><span>输入转速</span><b id="o-rpm">1,500 r/min</b></div>
+      <input id="i-speed" type="range" autocomplete="off" min="0" max="1000" step="1" value="772">
+      <div class="hint">对数刻度 · 1 – 30,000 r/min · 视觉转速已压缩</div>
     </div>
   </div>
 
@@ -722,7 +724,7 @@ function applyMaterialFlags() {
  * 5. 状态
  * ======================================================= */
 const state = {
-  running: true, speedMul: 1, sunAngle: 0, autoFit: true,
+  running: true, rpm: 1500, visMul: 1, sunAngle: 0, autoFit: true,
   section: false, wireframe: false,
   explode: 0, explodeNow: 0,
   view: 'iso',
@@ -772,7 +774,7 @@ function build() {
   const { m, zs, zp, zr, n, width, k } = D;
 
   /* 阴影相机与地面适配模型尺寸 */
-  const R = D.outerR * 2.4 + D.length * 0.5;
+  const R = D.outerR * 3.2 + D.length;
   const sc = key.shadow.camera;
   sc.left = -R; sc.right = R; sc.top = R; sc.bottom = -R;
   sc.near = 1; sc.far = R * 8;
@@ -818,6 +820,7 @@ function build() {
     tag(ringMesh, 'ring', '内齿圈', `Zr = ${zr} · 内齿面与行星轮啮合`, G_FIX[0], G_FIX[1]);
     stage.add(ringMesh);
 
+    const bolts = [];
     for (let i = 0; i < 8; i++) {
       const a = (i / 8) * TAU + Math.PI / 8;
       const bolt = new THREE.Mesh(boltGeo, M.shaft);
@@ -825,6 +828,7 @@ function build() {
       bolt.rotation.z = a;
       tag(bolt, 'shaft', '壳体螺栓', `M${(1.6 * m).toFixed(0)} · 8 颗`, G_FIX[0], G_FIX[1]);
       stage.add(bolt);
+      bolts.push(bolt);
     }
 
     /* ---- 太阳轮 ---- */
@@ -836,6 +840,9 @@ function build() {
     stage.add(sun);
 
     /* ---- 轴系：第 1 级为输入轴，其余为级间联接轴 ---- */
+    let shaftMesh = null;
+    let coupleGrp = null;
+
     if (s === 0) {
       /* 输入轴：从太阳轮向后伸出箱体 */
       const inGeo = new THREE.CylinderGeometry(D.inShaftR, D.inShaftR, D.inLen, 28);
@@ -844,6 +851,7 @@ function build() {
       inShaft.position.z = -(D.inLen - width) / 2;
       tag(inShaft, 'shaft', '输入轴', `⌀${(D.inShaftR * 2).toFixed(0)} mm · 与太阳轮同转`, G_SUN[0], G_SUN[1]);
       sun.add(inShaft);
+      shaftMesh = inShaft;
 
       /* 输入轴承盖（固定在箱体，不转） */
       const capGeo = new THREE.CylinderGeometry(D.inShaftR * 1.75, D.inShaftR * 1.75, 1.5 * m, 30);
@@ -882,6 +890,7 @@ function build() {
       couple.position.z = (zPrevPlate + zSunBack) / 2 + 0.6 * m;
       couple.traverse((o) => { if (o.isMesh) tag(o, 'coupling', '联轴节', `第 ${s} → ${s + 1} 级动力传递`, G_SUN[0], G_SUN[1]); });
       sun.add(couple);
+      coupleGrp = couple;
     }
 
     /* ---- 行星架 ---- */
@@ -917,6 +926,7 @@ function build() {
     }
 
     const planets = [];
+    const pins = [];
     for (let i = 0; i < n; i++) {
       const th = (i * TAU) / n;
       const x = Math.cos(th) * D.armDist;
@@ -933,33 +943,126 @@ function build() {
       pin.position.set(x, y, 0);
       tag(pin, 'shaft', '行星轮销轴', `⌀${(D.pinR * 2).toFixed(0)} mm`, G_CAR[0], G_CAR[1]);
       carrier.add(pin);
+      pins.push(pin);
     }
 
-    stageRefs.push({ group: stage, sun, carrier, planets, pBack, pFront, outShaft, outFlange });
+    stageRefs.push({
+      group: stage, sun, carrier, planets, pins, bolts, pBack, pFront, outShaft, outFlange,
+      shaft: shaftMesh, shaftBase: shaftMesh ? shaftMesh.position.z : 0,
+      couple: coupleGrp, coupleBase: coupleGrp ? coupleGrp.position.z : 0,
+    });
   }
 
   if (state.view === 'iso') VIEW_DIR.copy(isoDir());
   applyExplode();
 }
 
+/**
+ * 爆炸布局：把每个零件沿轴线排成互不重叠的层
+ * 从齿圈两端向外依次堆叠，每层按零件自身厚度让位 → 任意两件都不会穿插
+ */
+function explodeLayout() {
+  const { width, plateT, plateZ, inLen, outLen, m } = D;
+  const cl = D.outerR * 0.10;                 // 层间留白
+  const pinLen = width + 2 * plateT + 2.5 * m;
+
+  const back = [
+    { id: 'sun',    half: width / 2 },
+    { id: 'shaft',  half: inLen / 2 },
+    { id: 'couple', half: 1.9 * m },
+  ];
+
+  const front = [
+    { id: 'pin',       half: pinLen / 2 },
+    { id: 'pBack',     half: plateT / 2 },
+    { id: 'planet',    half: width / 2 },
+    { id: 'pFront',    half: plateT / 2 },
+    { id: 'outFlange', half: 0.9 * m },
+    { id: 'outShaft',  half: outLen / 2 },
+  ];
+
+  const pos = {};
+
+  let z = -width / 2;
+  for (const it of back) {
+    z -= cl + it.half;
+    pos[it.id] = z;
+    z -= it.half;
+  }
+  const zMin = z;
+
+  z = width / 2;
+  for (const it of front) {
+    z += cl + it.half;
+    pos[it.id] = z;
+    z += it.half;
+  }
+  const zMax = z;
+
+  return { pos, zMin, zMax, span: zMax - zMin };
+}
+
 function applyExplode() {
   const f = state.explodeNow;
+  const R = D.outerR;
   const mid = (D.k - 1) / 2;
+  const L = explodeLayout();
 
-  const stageGap = f * D.outerR * 0.62;   // 级与级之间
-  const partGap  = f * D.outerR * 0.40;   // 太阳轮组 ←→ 行星架
-  const plateGap = f * D.outerR * 0.10;   // 行星架两片腹板
+  // 分段缓动：各部件按顺序依次分离
+  const seg = (d) => {
+    if (f <= d) return 0;
+    const t = Math.min(1, (f - d) / (1 - d));
+    return t * t * (3 - 2 * t);
+  };
+  const mix = (a, b, t) => a + (b - a) * t;
+
+  const gStage   = seg(0.00) * L.span * 1.06;   // 级与级（k=1 时为 0）
+  const sSun     = seg(0.06);
+  const sPin     = seg(0.12);
+  const sPlate   = seg(0.18);
+  const sPlanet  = seg(0.26);
+  const sBolt    = seg(0.30);
+  const sOut     = seg(0.36);
 
   stageRefs.forEach((ref, i) => {
-    ref.group.position.z = D.zStage[i] + (i - mid) * stageGap;
-    ref.sun.position.z = -partGap;
-    ref.carrier.position.z = partGap;
+    ref.group.position.z = D.zStage[i] + (i - mid) * gStage;
 
-    if (ref.pBack) ref.pBack.position.z = -D.plateZ - plateGap;
-    if (ref.pFront) ref.pFront.position.z = D.plateZ + plateGap;
+    /* 太阳轮组：太阳轮、其上的轴、联轴节各自独立层位 */
+    const sunZ = mix(0, L.pos.sun, sSun);
+    ref.sun.position.z = sunZ;
 
-    if (ref.outShaft) ref.outShaft.position.z = D.plateZ + D.plateT / 2 + D.outLen / 2 + plateGap;
-    if (ref.outFlange) ref.outFlange.position.z = D.plateZ + D.plateT / 2 + 1.3 * D.m + plateGap;
+    if (ref.shaft) {
+      ref.shaft.position.z = mix(ref.shaftBase, L.pos.shaft, sSun) - sunZ;
+    }
+    if (ref.couple) {
+      ref.couple.position.z = mix(ref.coupleBase, L.pos.couple, sSun) - sunZ;
+    }
+
+    /* 行星架：腹板、销轴、行星轮逐层拉开 */
+    ref.pBack.position.z = mix(-D.plateZ, L.pos.pBack, sPlate);
+    ref.pFront.position.z = mix(D.plateZ, L.pos.pFront, sPlate);
+
+    for (const pin of ref.pins) pin.position.z = mix(0, L.pos.pin, sPin);
+
+    for (let j = 0; j < ref.planets.length; j++) {
+      const th = (j * TAU) / ref.planets.length;
+      const rr = D.armDist * (1 + sPlanet * 0.32);
+      ref.planets[j].position.set(
+        Math.cos(th) * rr,
+        Math.sin(th) * rr,
+        mix(0, L.pos.planet, sPlanet)
+      );
+    }
+
+    /* 壳体螺栓退出 + 输出侧 */
+    for (const bolt of ref.bolts) bolt.position.z = mix(0, R * 0.42, sBolt);
+
+    if (ref.outShaft) {
+      ref.outShaft.position.z = mix(D.plateZ + D.plateT / 2 + D.outLen / 2, L.pos.outShaft, sOut);
+    }
+    if (ref.outFlange) {
+      ref.outFlange.position.z = mix(D.plateZ + D.plateT / 2 + 1.3 * D.m, L.pos.outFlange, sOut);
+    }
   });
 }
 
@@ -987,30 +1090,44 @@ function dirFor(name) {
 function silhouettePoints() {
   const pts = [];
   const ex = state.explode ? 1 : 0;
+  const R = D.outerR;
   const mid = (D.k - 1) / 2;
-  const stageGap = ex * D.outerR * 0.62;
-  const partGap  = ex * D.outerR * 0.40;
-  const plateGap = ex * D.outerR * 0.10;
+  const L = explodeLayout();
+  const gStage = ex * L.span * 1.06;
 
-  // 每一级的齿圈前后端面整圆（近端面透视放大最多）
+  // 行星轮径向散开后的最大半径
+  const rMax = Math.max(R, D.armDist * 1.32 + D.rPlanet + D.m);
+
   for (let s = 0; s < D.k; s++) {
-    const zc = D.zStage[s] + (s - mid) * stageGap;
+    const zc = D.zStage[s] + (s - mid) * gStage;
+
+    // 齿圈前后端面整圆（近端面透视放大最多）
     for (const z of [zc - D.width / 2, zc + D.width / 2]) {
-      for (let i = 0; i < 48; i++) {
-        const a = (i / 48) * TAU;
-        pts.push(new THREE.Vector3(Math.cos(a) * D.outerR, Math.sin(a) * D.outerR, z));
+      for (let i = 0; i < 40; i++) {
+        const a = (i / 40) * TAU;
+        pts.push(new THREE.Vector3(Math.cos(a) * R, Math.sin(a) * R, z));
+      }
+    }
+
+    // 爆炸后：轴向两极（只有轴，半径很小）+ 行星轮外缘
+    if (ex) {
+      for (let i = 0; i < 16; i++) {
+        const a = (i / 16) * TAU;
+        const cx = Math.cos(a), cy = Math.sin(a);
+        pts.push(new THREE.Vector3(cx * R * 0.18, cy * R * 0.18, zc + L.zMin));
+        pts.push(new THREE.Vector3(cx * R * 0.18, cy * R * 0.18, zc + L.zMax));
+      }
+      for (let i = 0; i < 24; i++) {
+        const a = (i / 24) * TAU;
+        pts.push(new THREE.Vector3(
+          Math.cos(a) * rMax, Math.sin(a) * rMax, zc + L.pos.planet
+        ));
       }
     }
   }
 
-  // 轴向极限（爆炸后太阳轮组向后、行星架向后出轴）
-  const z0 = D.zStage[0] + (0 - mid) * stageGap;
-  const zN = D.zStage[D.k - 1] + (D.k - 1 - mid) * stageGap;
-  pts.push(new THREE.Vector3(0, 0, z0 - partGap - D.width / 2 - 18 * D.m));
-  pts.push(new THREE.Vector3(0, 0, zN + partGap + D.plateZ + plateGap + D.plateT / 2 + D.outLen));
-
   // 底部投影点，保证地面阴影不被裁掉
-  pts.push(new THREE.Vector3(0, -D.outerR, 0), new THREE.Vector3(0, -D.outerR * 1.15, 0));
+  pts.push(new THREE.Vector3(0, -R, 0), new THREE.Vector3(0, -R * 1.15, 0));
   return pts;
 }
 
@@ -1067,10 +1184,10 @@ function frameModel(padding = 1.28) {
 }
 
 /**
- * 仅重新调整相机距离，保留用户当前的视角方向与目标点
- * 用于爆炸切换、窗口尺寸变化等“不应该重置视角”的场景
+ * 仅重新调整相机距离，保留用户当前的视角方向
+ * recenter = true 时还会把模型平移到面板右侧的可视区（仍不改变朝向）
  */
-function refitDistance(padding = 1.20) {
+function refitDistance(padding = 1.26, recenter = false) {
   const target = controls.target.clone();
   const dir = camera.position.clone().sub(target);
   const dist0 = dir.length();
@@ -1094,6 +1211,35 @@ function refitDistance(padding = 1.20) {
   }
 
   camera.position.copy(target).addScaledVector(dir, dist);
+  camera.lookAt(target);
+  camera.updateMatrixWorld();
+
+  if (recenter) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const p of pts) {
+      v.copy(p).project(camera);
+      if (v.x < minX) minX = v.x;
+      if (v.x > maxX) maxX = v.x;
+      if (v.y < minY) minY = v.y;
+      if (v.y > maxY) maxY = v.y;
+    }
+
+    const halfH = dist * Math.tan((camera.fov * DEG) / 2);
+    const halfW = halfH * camera.aspect;
+    const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+    const up = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
+    const targetX = (window.innerWidth > 860 && !$('panel').classList.contains('collapsed')) ? 0.17 : 0;
+
+    // 相机与目标点同步平移 → 朝向完全不变，只是重新构图
+    const shift = new THREE.Vector3()
+      .addScaledVector(right, (((minX + maxX) / 2) - targetX) * halfW)
+      .addScaledVector(up, ((minY + maxY) / 2) * halfH);
+
+    camera.position.add(shift);
+    controls.target.copy(target).add(shift);
+    camera.lookAt(controls.target);
+  }
+
   camera.near = Math.max(0.05, dist * 0.002);
   camera.far = dist * 10;
   camera.updateProjectionMatrix();
@@ -1142,11 +1288,11 @@ function animate() {
     if (state.autoFit) {
       // 级数变化时重新定向并取景；其余参数只重新适配距离，保留用户视角
       if (D.k !== lastK) { lastK = D.k; frameModel(); }
-      else refitDistance(1.20);
+      else refitDistance(1.26);
     }
   }
 
-  if (state.running) state.sunAngle += dt * BASE_SPEED * state.speedMul;
+  if (state.running) state.sunAngle += dt * BASE_SPEED * state.visMul;
 
   if (Math.abs(state.explodeNow - state.explode) > 1e-4) {
     state.explodeNow += (state.explode - state.explodeNow) * Math.min(1, dt * 9);
@@ -1243,8 +1389,37 @@ function updateHover() {
  * ======================================================= */
 const $ = (id) => document.getElementById(id);
 
+/* ---------- 转速：对数刻度（低端细、高端到万级）---------- */
+const RPM_MIN = 1;
+const RPM_MAX = 30000;
+const SPEED_STEPS = 1000;
+
+const sliderToRpm = (v) => RPM_MIN * Math.pow(RPM_MAX / RPM_MIN, v / SPEED_STEPS);
+const rpmToSlider = (rpm) => Math.round(
+  (Math.log(Math.max(RPM_MIN, rpm) / RPM_MIN) / Math.log(RPM_MAX / RPM_MIN)) * SPEED_STEPS
+);
+
+/** 真实转速 → 可观看的视觉旋转倍率（对数压缩，保证不闪频） */
+const visualMul = (rpm) => Math.pow(Math.max(rpm, 0.01) / ((BASE_SPEED * 60) / TAU), 0.3);
+
+function fmtRpm(v) {
+  if (v >= 1000) return Math.round(v).toLocaleString('en-US');
+  if (v >= 100) return v.toFixed(0);
+  if (v >= 10) return v.toFixed(1);
+  return v.toFixed(2);
+}
+
 function inputRpm() {
-  return (BASE_SPEED * state.speedMul * 60) / TAU;
+  return state.rpm;
+}
+
+/** 统一更新所有转速相关显示 */
+function applySpeed(rpm) {
+  state.rpm = rpm;
+  state.visMul = visualMul(rpm);
+  $('o-rpm').textContent = fmtRpm(rpm) + ' r/min';
+  $('o-rpm-hd').textContent = fmtRpm(rpm);
+  $('s-out').innerHTML = fmtRpm(rpm / D.ratio) + '<small>r/min</small>';
 }
 
 const SLIDERS = [
@@ -1281,14 +1456,11 @@ $('preset').addEventListener('change', (e) => {
 });
 
 function updateAll() {
-  const rpmIn = inputRpm();
-  const rpmOut = rpmIn / D.ratio;
-
   $('model-code').textContent = 'NGW-' + Math.round(D.outerR * 2) + (D.k > 1 ? '-' + D.k + 'S' : '');
   $('model-ratio').textContent = D.ratio.toFixed(2);
   $('brand-line').textContent = D.k > 1 ? `${D.k} 级行星齿轮减速机` : '单级行星齿轮减速机';
-  $('o-rpm-hd').textContent = rpmIn.toFixed(0);
-  $('o-rpm').textContent = rpmIn.toFixed(0) + ' r/min';
+
+  applySpeed(state.rpm);
 
   $('s-gears').textContent = `${D.zs} / ${D.zp} / ${D.zr}`;
   $('s-m').innerHTML = D.m.toFixed(1) + '<small>mm</small>';
@@ -1298,7 +1470,6 @@ function updateAll() {
   $('s-k').textContent = D.k + ' 级';
   $('s-i1').textContent = D.ratio1.toFixed(2);
   $('s-i').textContent = D.ratio.toFixed(2);
-  $('s-out').innerHTML = rpmOut.toFixed(2) + '<small>r/min</small>';
   $('s-split').textContent = '×' + D.n;
   $('s-mass').innerHTML = D.mass.toFixed(2) + '<small>kg</small>';
 
@@ -1399,7 +1570,7 @@ $('btn-section').addEventListener('click', (e) => {
 $('btn-explode').addEventListener('click', (e) => {
   state.explode = state.explode ? 0 : 1;
   e.currentTarget.classList.toggle('active', !!state.explode);
-  if (state.autoFit) refitDistance(1.20);   // 只调距离，不重置视角
+  if (state.autoFit) refitDistance(1.22, true);   // 只调距离与构图，不改变视角方向
 });
 
 $('btn-wire').addEventListener('click', (e) => {
@@ -1409,10 +1580,7 @@ $('btn-wire').addEventListener('click', (e) => {
 });
 
 $('i-speed').addEventListener('input', (e) => {
-  state.speedMul = parseFloat(e.target.value);
-  $('o-rpm').textContent = inputRpm().toFixed(0) + ' r/min';
-  $('o-rpm-hd').textContent = inputRpm().toFixed(0);
-  $('s-out').innerHTML = (inputRpm() / D.ratio).toFixed(2) + '<small>r/min</small>';
+  applySpeed(sliderToRpm(parseFloat(e.target.value)));
 });
 
 function updateHash() {
@@ -1469,7 +1637,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight, false);
-  if (state.autoFit) refitDistance(1.20);   // 保持当前视角，只重新适配距离
+  if (state.autoFit) refitDistance(1.26);   // 保持当前视角，只重新适配距离
 });
 
 window.addEventListener('keydown', (e) => {
@@ -1492,6 +1660,8 @@ window.addEventListener('keydown', (e) => {
  * ======================================================= */
 readHash();
 syncSliders();
+$('i-speed').value = String(rpmToSlider(state.rpm));
+applySpeed(state.rpm);
 
 const hit = Object.entries(PRESETS).find(([, p]) =>
   p.k === CFG.k && p.m === CFG.m && p.zs === CFG.zs && p.zp === CFG.zp && p.n === CFG.n && p.bF === CFG.bF
